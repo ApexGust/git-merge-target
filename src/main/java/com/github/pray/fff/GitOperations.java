@@ -25,8 +25,9 @@ public class GitOperations {
 
     /**
      * 合并分支
+     * @return 如果发生冲突返回true，否则返回false
      */
-    public static void mergeBranch(@NotNull Project project,
+    public static boolean mergeBranch(@NotNull Project project,
                                  @NotNull GitRepository repository,
                                  String sourceBranch,
                                  String targetBranch) throws GitCommandException {
@@ -46,7 +47,43 @@ public class GitOperations {
             runGitCommand(project, root, GitCommand.PULL, "拉取代码", remoteName, targetBranch);
 
             // 3. 合并
-            runGitCommand(project, root, GitCommand.MERGE, "合并分支", "--no-ff", sourceBranch);
+            boolean hasConflict = false;
+            GitCommandResult mergeResult = null;
+            try {
+                GitLineHandler mergeHandler = new GitLineHandler(project, root, GitCommand.MERGE);
+                mergeHandler.addParameters("--no-ff", sourceBranch);
+                mergeResult = git.runCommand(mergeHandler);
+                
+                if (!mergeResult.success()) {
+                    // 检查是否是冲突导致的失败
+                    String errorOutput = mergeResult.getErrorOutputAsJoinedString();
+                    if (isMergeConflict(errorOutput)) {
+                        logger.warn("合并时发生冲突: {}", errorOutput);
+                        hasConflict = true;
+                    } else {
+                        // 不是冲突，抛出异常
+                        throw new GitCommandException("合并分支失败: " + errorOutput);
+                    }
+                }
+            } catch (GitCommandException e) {
+                // 如果已经检测到冲突，不重新抛出
+                if (!hasConflict) {
+                    throw e;
+                }
+            }
+            
+            // 即使merge命令返回成功，也要检查是否有未解决的冲突文件
+            if (!hasConflict) {
+                hasConflict = checkForUnmergedFiles(project, root, git);
+            }
+
+            // 如果有冲突，刷新仓库状态并返回
+            if (hasConflict) {
+                logger.info("检测到冲突，停止合并流程，停留在目标分支: {}", targetBranch);
+                // 执行 git status 来刷新 IDE 的仓库状态
+                refreshRepositoryStatus(project, root, git);
+                return true;
+            }
 
             // 4. 推送
             runGitCommand(project, root, GitCommand.PUSH, "推送代码", remoteName, targetBranch);
@@ -64,12 +101,85 @@ public class GitOperations {
             }
 
             logger.info("合并完成: {} -> {}", sourceBranch, targetBranch);
+            return false;
 
         } catch (GitCommandException e) {
             throw e;
         } catch (Exception e) {
             logger.error("未预期的错误", e);
             throw new GitCommandException("内部错误: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 检查错误消息是否表示合并冲突
+     */
+    private static boolean isMergeConflict(String errorMessage) {
+        if (errorMessage == null) {
+            return false;
+        }
+        String lowerMsg = errorMessage.toLowerCase();
+        return lowerMsg.contains("conflict") || 
+               lowerMsg.contains("冲突") ||
+               lowerMsg.contains("merge conflict") ||
+               lowerMsg.contains("unmerged") ||
+               lowerMsg.contains("automatic merge failed");
+    }
+
+    /**
+     * 检查是否有未解决的冲突文件
+     */
+    private static boolean checkForUnmergedFiles(@NotNull Project project, 
+                                                  @NotNull VirtualFile root, 
+                                                  @NotNull Git git) {
+        try {
+            GitLineHandler statusHandler = new GitLineHandler(project, root, GitCommand.STATUS);
+            statusHandler.addParameters("--porcelain");
+            GitCommandResult result = git.runCommand(statusHandler);
+            
+            if (result.success()) {
+                String output = result.getOutputAsJoinedString();
+                // 检查是否有未合并的文件（以"UU"、"AA"、"DD"等开头的行表示冲突）
+                if (output != null && !output.trim().isEmpty()) {
+                    String[] lines = output.split("\n");
+                    for (String line : lines) {
+                        if (line.length() >= 2) {
+                            char status1 = line.charAt(0);
+                            char status2 = line.charAt(1);
+                            // UU, AA, DD, AU, UA, DU, UD 等表示冲突
+                            if ((status1 == 'U' || status1 == 'A' || status1 == 'D') &&
+                                (status2 == 'U' || status2 == 'A' || status2 == 'D')) {
+                                logger.info("检测到未解决的冲突文件: {}", line);
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.warn("检查冲突文件状态时出错", e);
+        }
+        return false;
+    }
+
+    /**
+     * 刷新仓库状态，让 IDE 识别最新的冲突状态
+     */
+    private static void refreshRepositoryStatus(@NotNull Project project,
+                                                @NotNull VirtualFile root,
+                                                @NotNull Git git) {
+        try {
+            logger.info("刷新仓库状态以更新 IDE 冲突检测");
+            // 执行 git status 来刷新状态
+            GitLineHandler statusHandler = new GitLineHandler(project, root, GitCommand.STATUS);
+            GitCommandResult result = git.runCommand(statusHandler);
+            if (result.success()) {
+                logger.info("仓库状态刷新成功");
+            } else {
+                logger.warn("仓库状态刷新失败: {}", result.getErrorOutputAsJoinedString());
+            }
+        } catch (Exception e) {
+            logger.warn("刷新仓库状态时出错", e);
         }
     }
 
