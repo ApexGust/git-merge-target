@@ -1,24 +1,34 @@
 package com.github.pray.fff;
 
+import com.intellij.notification.NotificationGroupManager;
+import com.intellij.notification.NotificationType;
 import com.intellij.openapi.actionSystem.AnAction;
 import com.intellij.openapi.actionSystem.AnActionEvent;
-import com.intellij.openapi.project.Project;
-import git4idea.GitUtil;
-import git4idea.repo.GitRepository;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.progress.ProgressIndicator;
 import com.intellij.openapi.progress.ProgressManager;
 import com.intellij.openapi.progress.Task;
-import org.jetbrains.annotations.NotNull;
-import com.intellij.openapi.application.ApplicationManager;
-import com.intellij.openapi.ui.Messages;
+import com.intellij.openapi.project.Project;
 import com.intellij.openapi.ui.ComboBox;
 import com.intellij.openapi.ui.DialogWrapper;
-import com.intellij.notification.NotificationGroupManager;
-import com.intellij.notification.NotificationType;
+import com.intellij.openapi.ui.Messages;
+import com.intellij.ide.util.PropertiesComponent;
+import git4idea.GitLocalBranch;
+import git4idea.GitUtil;
+import git4idea.repo.GitRepository;
+import git4idea.repo.GitRepositoryManager;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import javax.swing.*;
+import javax.swing.event.PopupMenuEvent;
+import javax.swing.event.PopupMenuListener;
 import java.awt.*;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+import java.util.Arrays;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -27,115 +37,331 @@ public class MergeToTargetBranchAction extends AnAction {
     public static final String NOTIFICATION_GROUP_ID = "MergeToTargetBranch.Notifications";
 
     @Override
-    public void actionPerformed(AnActionEvent e) {
+    public void actionPerformed(@NotNull AnActionEvent e) {
         Project project = e.getProject();
         if (project == null) return;
 
-        GitRepository repository = GitUtil.getRepositoryManager(project).getRepositories().get(0);
-        
-        // 初始化 GitOperations
-        GitOperations.init(project, repository);
-        
-        // 保存当前分支名
+        // 1. 直接使用 Git API（升级到 2.x 插件后不再需要反射）
+        GitRepositoryManager manager = GitUtil.getRepositoryManager(project);
+        List<GitRepository> repositories = manager.getRepositories();
+        if (repositories.isEmpty()) {
+            Messages.showErrorDialog(project, "未找到 Git 仓库", "错误");
+            return;
+        }
+        GitRepository repository = repositories.get(0);
+
         String currentBranch = repository.getCurrentBranchName();
+        if (currentBranch == null) {
+            Messages.showErrorDialog(project, "无法获取当前分支信息", "错误");
+            return;
+        }
+
+        // 获取本地分支列表
+        List<String> branchNames = repository.getBranches().getLocalBranches().stream()
+                .map(GitLocalBranch::getName)
+                .collect(Collectors.toList());
+
+        // 2. 优化：将数据直接传入 Dialog，不在 Dialog 内部再次查询
+        BranchSelectionDialog dialog = new BranchSelectionDialog(project, branchNames);
         
-        // 显示分支选择对话框
-        BranchSelectionDialog dialog = new BranchSelectionDialog(project);
         if (dialog.showAndGet()) {
             String selectedBranch = dialog.getSelectedBranch();
             if (selectedBranch != null) {
-                executeMergeTask(project, selectedBranch, currentBranch);
+                // 逻辑保持不变：如果没有手动设置默认，则记住当前选择
+                if (!BranchPreferenceHelper.hasManualDefaultBranch(project)) {
+                    BranchPreferenceHelper.setAutoRememberBranch(project, selectedBranch);
+                }
+                executeMergeTask(project, repository, selectedBranch, currentBranch);
             }
         }
     }
 
-    private void executeMergeTask(Project project, String targetBranch, String originalBranch) {
+    private void executeMergeTask(Project project, GitRepository repository, String targetBranch, String originalBranch) {
         ProgressManager.getInstance().run(new Task.Backgroundable(project, "Merging Branches") {
             @Override
             public void run(@NotNull ProgressIndicator indicator) {
                 try {
                     indicator.setIndeterminate(false);
                     indicator.setText("Starting merge process...");
-                    
-                    GitOperations.mergeBranch(originalBranch, targetBranch);
-                    
-                    ApplicationManager.getApplication().invokeLater(() -> {
-                        notifySuccess(project, 
-                            "Merge Successful", 
-                            String.format("Successfully merged %s to %s!", originalBranch, targetBranch));
-                    });
-                    
+                    GitOperations.mergeBranch(project, repository, originalBranch, targetBranch);
+                    ApplicationManager.getApplication().invokeLater(() -> 
+                        showNotification(project, "Merge Successful", 
+                               String.format("Successfully merged %s to %s!", originalBranch, targetBranch), 
+                               NotificationType.INFORMATION));
                 } catch (GitOperations.GitCommandException ex) {
                     logger.warn("Merge operation failed: " + ex.getMessage());
-                    
-                    ApplicationManager.getApplication().invokeLater(() -> {
-                        notifyWarning(project,
-                            "Merge failed. Please resolve conflicts manually. Current branch: " + targetBranch,
-                            "Failure reason: " + ex.getMessage()
-                        );
-                    });
+                    ApplicationManager.getApplication().invokeLater(() -> 
+                        showNotification(project, "Merge Failed", 
+                               "Current branch: " + targetBranch + ". Reason: " + ex.getMessage(), 
+                               NotificationType.WARNING));
+                } catch (Exception ex) {
+                    logger.error("Unexpected error during merge", ex);
+                    ApplicationManager.getApplication().invokeLater(() -> 
+                        showNotification(project, "Merge Failed", 
+                               "Unexpected error: " + ex.getMessage(), 
+                               NotificationType.ERROR));
                 }
             }
         });
     }
 
-    // 分支选择对话框
-    private static class BranchSelectionDialog extends DialogWrapper {
-        private final ComboBox<String> branchComboBox;
+    private static void showNotification(Project project, String title, String content, NotificationType type) {
+        NotificationGroupManager.getInstance()
+                .getNotificationGroup(NOTIFICATION_GROUP_ID)
+                .createNotification(title, content, type)
+                .notify(project);
+    }
 
-        public BranchSelectionDialog(Project project) {
-            super(project);
-            setTitle("Select Target Branch");
+    // 3. 优化：提取偏好设置逻辑到静态内部类，减少主类混乱
+    private static class BranchPreferenceHelper {
+        private static final String MANUAL_DEFAULT_BRANCH_KEY = "MergeToTargetBranch.ManualDefaultBranch";
+        private static final String AUTO_REMEMBER_BRANCH_KEY = "MergeToTargetBranch.AutoRememberBranch";
+        private static final List<String> SMART_DEFAULT_BRANCHES = Arrays.asList("main", "master", "develop");
+
+        static String getManualDefaultBranch(Project project) {
+            return PropertiesComponent.getInstance(project).getValue(MANUAL_DEFAULT_BRANCH_KEY);
+        }
+
+        static void setManualDefaultBranch(Project project, String branchName) {
+            PropertiesComponent.getInstance(project).setValue(MANUAL_DEFAULT_BRANCH_KEY, branchName);
+        }
+
+        static void clearManualDefaultBranch(Project project) {
+            PropertiesComponent.getInstance(project).unsetValue(MANUAL_DEFAULT_BRANCH_KEY);
+        }
+
+        static boolean hasManualDefaultBranch(Project project) {
+            return getManualDefaultBranch(project) != null;
+        }
+
+        static void setAutoRememberBranch(Project project, String branchName) {
+            PropertiesComponent.getInstance(project).setValue(AUTO_REMEMBER_BRANCH_KEY, branchName);
+        }
+
+        static String getEffectiveDefaultBranch(Project project, List<String> availableBranches) {
+            String manual = getManualDefaultBranch(project);
+            if (manual != null && availableBranches.contains(manual)) return manual;
+
+            String auto = PropertiesComponent.getInstance(project).getValue(AUTO_REMEMBER_BRANCH_KEY);
+            if (auto != null && availableBranches.contains(auto)) return auto;
+
+            return SMART_DEFAULT_BRANCHES.stream()
+                    .filter(availableBranches::contains)
+                    .findFirst()
+                    .orElse(null);
+        }
+    }
+
+    // 4. 优化：CellRenderer 性能优化（组件复用）
+    private static class BranchListCellRenderer implements ListCellRenderer<String> {
+        private final Project project;
+        private final DefaultListCellRenderer defaultRenderer = new DefaultListCellRenderer();
+        private int hoveredIndex = -1;
+
+        // 预初始化组件，避免在 getListCellRendererComponent 中重复创建
+        private final JPanel panel = new JPanel(new BorderLayout(5, 0));
+        private final JLabel nameLabel = new JLabel();
+        private final JLabel starLabel = new JLabel();
+
+        public BranchListCellRenderer(Project project) {
+            this.project = project;
+            panel.setOpaque(true);
+            panel.setBorder(BorderFactory.createEmptyBorder(2, 5, 2, 5));
+            panel.add(nameLabel, BorderLayout.WEST);
             
-            List<String> branches;
-            GitRepository repository = GitUtil.getRepositoryManager(project).getRepositories().get(0);
-            try {
-                branches = repository.getBranches().getLocalBranches().stream()
-                        .map(branch -> branch.getName())
-                        .collect(Collectors.toList());
-            } catch (Exception e) {
-                logger.error("Failed to get branch list", e);
-                branches = List.of();
-                Messages.showErrorDialog(project, 
-                    "Failed to get branch list: " + e.getMessage(), 
-                    "Error");
-            }
-            
-            branchComboBox = new ComboBox<>(branches.toArray(new String[0]));
-            init();
+            starLabel.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 14));
+            starLabel.setHorizontalAlignment(SwingConstants.CENTER);
+            starLabel.setPreferredSize(new Dimension(20, 20));
+            panel.add(starLabel, BorderLayout.EAST);
+        }
+
+        public void setHoveredIndex(int index) {
+            this.hoveredIndex = index;
         }
 
         @Override
-        protected JComponent createCenterPanel() {
-            JPanel panel = new JPanel(new BorderLayout());
-            panel.add(new JLabel("Select target branch to merge into:"), BorderLayout.NORTH);
+        public Component getListCellRendererComponent(JList<? extends String> list, String value,
+                                                      int index, boolean isSelected, boolean cellHasFocus) {
+            if (value == null) return defaultRenderer.getListCellRendererComponent(list, null, index, isSelected, cellHasFocus);
+
+            boolean isInDropdown = index >= 0;
+            String currentManualDefault = BranchPreferenceHelper.getManualDefaultBranch(project);
+            boolean isDefault = value.equals(currentManualDefault);
+            boolean isHovered = (index == hoveredIndex);
+
+            // 设置文本
+            nameLabel.setText(value);
+
+            // 设置颜色
+            if (isSelected) {
+                panel.setBackground(list.getSelectionBackground());
+                nameLabel.setForeground(list.getSelectionForeground());
+            } else {
+                panel.setBackground(list.getBackground());
+                nameLabel.setForeground(list.getForeground());
+            }
+
+            // 设置星星状态
+            if (isInDropdown) {
+                starLabel.setVisible(true);
+                if (isDefault) {
+                    starLabel.setText("★");
+                    starLabel.setForeground(new Color(255, 200, 0));
+                    starLabel.setToolTipText("默认分支，点击取消");
+                } else if (isHovered || cellHasFocus) {
+                    starLabel.setText("☆");
+                    starLabel.setForeground(Color.GRAY);
+                    starLabel.setToolTipText("点击设为默认分支");
+                } else {
+                    starLabel.setVisible(false);
+                }
+            } else {
+                starLabel.setVisible(false);
+            }
+
+            return panel;
+        }
+    }
+
+    private static class BranchSelectionDialog extends DialogWrapper {
+        private final ComboBox<String> branchComboBox;
+        private final Project project;
+        private final List<String> branches;
+        private final BranchListCellRenderer cellRenderer;
+
+        // 优化：构造函数接收准备好的数据
+        public BranchSelectionDialog(Project project, List<String> branches) {
+            super(project);
+            this.project = project;
+            this.branches = branches;
+            
+            branchComboBox = new ComboBox<>(branches.toArray(new String[0]));
+            cellRenderer = new BranchListCellRenderer(project);
+            branchComboBox.setRenderer(cellRenderer);
+
+            String effectiveDefault = BranchPreferenceHelper.getEffectiveDefaultBranch(project, branches);
+            if (effectiveDefault != null) {
+                branchComboBox.setSelectedItem(effectiveDefault);
+            }
+
+            setupStarInteraction();
+            setTitle("选择目标分支");
+            init();
+        }
+
+        private void setupStarInteraction() {
+            branchComboBox.addPopupMenuListener(new PopupMenuListener() {
+                @Override
+                public void popupMenuWillBecomeVisible(PopupMenuEvent e) {
+                    SwingUtilities.invokeLater(() -> attachMouseListenerToPopupList());
+                }
+                @Override public void popupMenuWillBecomeInvisible(PopupMenuEvent e) { cellRenderer.setHoveredIndex(-1); }
+                @Override public void popupMenuCanceled(PopupMenuEvent e) { cellRenderer.setHoveredIndex(-1); }
+            });
+        }
+
+        // 5. 优化：简化的 JList 查找逻辑，递归查找是最稳健的
+        private void attachMouseListenerToPopupList() {
+            JList<?> list = findJListInComponent(branchComboBox);
+            if (list == null) {
+                // 尝试查找所有 Window (为了兼容某些 LookAndFeel 的 Popup 实现)
+                for (Window window : Window.getWindows()) {
+                    if (window instanceof Container && window.isShowing()) {
+                         list = findJListInComponent((Container) window);
+                         if (list != null && isBelongToComboBox(list, branchComboBox)) break;
+                         else list = null;
+                    }
+                }
+            }
+
+            if (list != null) {
+                // 清理旧监听器防止重复添加
+                for (java.awt.event.MouseListener ml : list.getMouseListeners()) {
+                    if (ml instanceof StarMouseAdapter) return;
+                }
+                StarMouseAdapter adapter = new StarMouseAdapter(list);
+                list.addMouseListener(adapter);
+                list.addMouseMotionListener(adapter);
+            }
+        }
+
+        private JList<?> findJListInComponent(Container container) {
+            for (Component comp : container.getComponents()) {
+                if (comp instanceof JList) return (JList<?>) comp;
+                if (comp instanceof Container) {
+                    JList<?> result = findJListInComponent((Container) comp);
+                    if (result != null) return result;
+                }
+            }
+            return null;
+        }
+
+        // 确保找到的 List 确实是属于当前 ComboBox 的
+        private boolean isBelongToComboBox(JList<?> list, JComboBox<?> comboBox) {
+            if (comboBox.getItemCount() == 0) return false;
+            ListModel<?> model = list.getModel();
+            return model.getSize() > 0 && model.getElementAt(0).equals(comboBox.getItemAt(0));
+        }
+
+        private class StarMouseAdapter extends MouseAdapter {
+            private final JList<?> list;
+            
+            public StarMouseAdapter(JList<?> list) { this.list = list; }
+
+            @Override
+            public void mouseMoved(MouseEvent e) {
+                int index = list.locationToIndex(e.getPoint());
+                if (index != -1 && index != cellRenderer.hoveredIndex) {
+                    cellRenderer.setHoveredIndex(index);
+                    list.repaint();
+                }
+            }
+
+            @Override
+            public void mouseExited(MouseEvent e) {
+                cellRenderer.setHoveredIndex(-1);
+                list.repaint();
+            }
+
+            @Override
+            public void mousePressed(MouseEvent e) {
+                int index = list.locationToIndex(e.getPoint());
+                if (index != -1 && isClickOnStar(e, index)) {
+                    e.consume();
+                    String branch = branches.get(index);
+                    toggleDefaultBranch(branch);
+                    list.repaint();
+                }
+            }
+
+            private boolean isClickOnStar(MouseEvent e, int index) {
+                Rectangle bounds = list.getCellBounds(index, index);
+                if (bounds == null) return false;
+                // 假设星星在最右侧 30px 区域
+                return e.getX() > (bounds.x + bounds.width - 30);
+            }
+        }
+
+        private void toggleDefaultBranch(String branchName) {
+            if (branchName.equals(BranchPreferenceHelper.getManualDefaultBranch(project))) {
+                BranchPreferenceHelper.clearManualDefaultBranch(project);
+                showNotification(project, "取消成功", "已取消默认分支: " + branchName, NotificationType.INFORMATION);
+            } else {
+                BranchPreferenceHelper.setManualDefaultBranch(project, branchName);
+                showNotification(project, "设置成功", "默认分支已设为: " + branchName, NotificationType.INFORMATION);
+            }
+        }
+
+        @Override
+        protected @Nullable JComponent createCenterPanel() {
+            JPanel panel = new JPanel(new BorderLayout(0, 5));
+            panel.add(new JLabel("选择目标分支:"), BorderLayout.NORTH);
             panel.add(branchComboBox, BorderLayout.CENTER);
+            // 设置对话框宽度
+            panel.setPreferredSize(new Dimension(400, panel.getPreferredSize().height));
             return panel;
         }
 
-        public String getSelectedBranch() {
-            return (String) branchComboBox.getSelectedItem();
-        }
-    }
-
-    private void notifyError(Project project, String title, String message) {
-        NotificationGroupManager.getInstance()
-                .getNotificationGroup(NOTIFICATION_GROUP_ID)
-                .createNotification(title, message, NotificationType.ERROR)
-                .notify(project);
-    }
-
-    private void notifySuccess(Project project, String title, String message) {
-        NotificationGroupManager.getInstance()
-                .getNotificationGroup(NOTIFICATION_GROUP_ID)
-                .createNotification(title, message, NotificationType.INFORMATION)
-                .notify(project);
-    }
-
-    private void notifyWarning(Project project, String title, String message) {
-        NotificationGroupManager.getInstance()
-                .getNotificationGroup(NOTIFICATION_GROUP_ID)
-                .createNotification(title, message, NotificationType.WARNING)
-                .notify(project);
+        public String getSelectedBranch() { return (String) branchComboBox.getSelectedItem(); }
     }
 }

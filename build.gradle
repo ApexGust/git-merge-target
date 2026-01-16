@@ -1,25 +1,36 @@
 plugins {
     id 'java'
-    id 'org.jetbrains.intellij' version '1.16.1'
+    id 'org.jetbrains.intellij.platform' version '2.10.5'
 }
 
 group = 'com.github.pray.fff'
-version = '0.0.6'
+version = '0.0.7'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
 
 repositories {
     mavenCentral()
+    intellijPlatform {
+        defaultRepositories()
+    }
 }
 
 dependencies {
+    intellijPlatform {
+        intellijIdeaCommunity('2024.2')
+        // Git 插件（包含所需的 VCS 依赖）
+        bundledPlugin('Git4Idea')
+    }
     testImplementation platform('org.junit:junit-bom:5.10.0')
     testImplementation 'org.junit.jupiter:junit-jupiter'
 }
 
-intellij {
-    version = '2023.2.5+'
-    type = 'IC'
-    plugins = ['Git4Idea']
-    sandboxDir = project.rootDir.canonicalPath + "/.sandbox"
+intellijPlatform {
+    buildSearchableOptions = false
+    instrumentCode = true
 }
 
 test {
@@ -33,7 +44,7 @@ tasks {
     }
     
     patchPluginXml {
-        sinceBuild = "232"
+        sinceBuild = "242"  // 更新为 2024.2 对应的 build number
         untilBuild = "433.*"
         pluginDescription = '''
         <p>A Git branch merging plugin that simplifies your Git workflow by providing one-click branch merging capabilities.</p>
@@ -52,7 +63,6 @@ tasks {
     }
 
     runIde {
-        autoReloadPlugins = true
         jvmArgs = [
             "-Xmx2g",
             "-XX:ReservedCodeCacheSize=512m",
